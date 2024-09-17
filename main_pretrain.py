@@ -12,25 +12,41 @@ import argparse
 import datetime
 import json
 import numpy as np
+import pandas as pd
 import os
+
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'prov-gigapath')))
+
+# libraries related to Prov-GigaPath
+from finetune.utils import slide_collate_fn
+from finetune.task_configs.utils import load_task_config
+from finetune.datasets.slide_datatset import SlideDataset
+from train_transforms import SlideDatasetWithTransforms
+from gigapath import slide_encoder
+
 import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader, RandomSampler
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+from functools import partial
 
 import timm
-
 assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
+from timm.models.registry import register_model
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
+from models_gigapath import CustomLongNetViT
 
 from engine_pretrain import train_one_epoch
 
@@ -74,6 +90,18 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
+    
+    ### Additional aruguments specfic to Prov-GigaPath
+    parser.add_argument('--prov_giga_dir_path', default='../prov-gigapath/', type=str,
+                        help='location of the prov-gigapath directory')
+    parser.add_argument('--embeddings_path', default='data/p53_stage2_pretrain_embeddings/h5_files', type=str,
+                        help='location of the tile embeddings')
+    parser.add_argument('--dataset_csv_path', default='dataset_csv/p53/p53.csv', type=str,
+                        help='location of the dataset csv')
+    parser.add_argument('--task_config_path', default='finetune/task_configs/p53.yaml', type=str,
+                        help='location of the task config yaml')
+    parser.add_argument('--use_gigapath_model', action='store_true',
+                         help='Use Gigapath model')
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -103,6 +131,11 @@ def get_args_parser():
 
     return parser
 
+@register_model
+def custom_gigapath_slide_enc12l768d(**kwargs):
+    model = CustomLongNetViT(embed_dim=768, depth=12, mlp_ratio=4, global_pool = True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
 
 def main(args):
     misc.init_distributed_mode(args)
@@ -119,13 +152,12 @@ def main(args):
 
     cudnn.benchmark = True
 
-    # simple augmentation
-    transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # Loading the Prov-GigaPath dataset
+    dataset_csv = pd.read_csv(args.prov_giga_dir_path + args.dataset_csv_path)
+    DatasetClass = SlideDatasetWithTransforms # use SlidesDataset for no transforms
+    task_config = load_task_config(args.prov_giga_dir_path + args.task_config_path)
+    train_splits = pd.read_csv(args.prov_giga_dir_path + "dataset_csv/p53/train_0.csv")['slide_id'].to_list()
+    dataset_train = DatasetClass(dataset_csv, args.prov_giga_dir_path + args.embeddings_path, train_splits, task_config, split_key="slide_id")
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -153,7 +185,13 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    if not args.use_gigapath_model:
+        model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    else:
+        # loading the Gigapath model
+        model = slide_encoder.create_model(pretrained = "hf_hub:prov-gigapath/prov-gigapath", 
+                                            model_arch = "custom_gigapath_slide_enc12l768d", 
+                                            in_chans=1536)
 
     model.to(device)
 
@@ -177,6 +215,7 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
